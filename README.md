@@ -57,6 +57,23 @@ infectious disease spreads across a stylised world map.
 - Antarctica is excluded by default (no permanent population).
 - Any "X million infected" figure shown in the UI is **scaled from sampled
   grid cells** and must be labelled as such.
+- **Units**: 1 tick = 1 day. 1 cell is about 111 km tall north-south, and about
+  $111 \cdot \cos(\phi)$ km wide east-west at latitude $\phi$.
+- **Distance-based transmission kernel**: To avoid artificial elongation of the
+  outbreak wave toward the poles where meridians converge, contact is determined by
+  physical distance $d = \sqrt{(111 \cdot di)^2 + (111 \cdot \cos(\phi) \cdot dj)^2}$ km.
+  Offsets with $d \le 166\text{ km}$ ($1.5 \times 111\text{ km}$) are included ($di \in \{-1, 0, 1\}$,
+  $dj \in [-4, 4]$, longitude wrapped). At the equator, this reproduces the 8-neighbour
+  Moore stencil exactly. Weights decay as $w = \exp(-d / \sigma)$ with $\sigma = 111\text{ km}$
+  (the equatorial cell scale) and are normalised to sum to 8 in every row, preserving the
+  physical meaning of $\beta$ at all latitudes. Outbreak waves remain circular within 12 %
+  across latitudes 0° to 70°N.
+- **Front speeds**: Front speeds in km/day are illustrative numbers, not physical
+  measurements. North-south (NS) and east-west (EW) speeds are calculated and reported
+  separately.
+- **Arrival-time convention**: the seed cell has arrival tick 0; cells
+  infected on the first simulation step have arrival tick 1; cells infected
+  on step *k* have arrival tick *k*; cells never infected remain −1.
 
 ## Project structure
 

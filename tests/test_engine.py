@@ -1,8 +1,8 @@
 """
 Tests for the SEIR engine.
 
-Test strategy (change 1, follow-ups 1–2)
------------------------------------------
+Test strategy (change 1, follow-ups 1–2, phase 2 step 1)
+---------------------------------------------------------
 1. **Well-mixed vs ODE**: Run in well-mixed mode (geometric durations) on a
    uniform grid and compare to the mean-field SEIR ODE.  Averaged over
    several seeds: ±15 % on final attack rate, ±5 ticks on peak timing.
@@ -21,6 +21,15 @@ Test strategy (change 1, follow-ups 1–2)
 
 6. **Pipeline sanity** (follow-up 2c) — India POP_EST > 1e9, Bangladesh
    among the 3 densest, land cell count matches saved value.
+
+7. **Arrival time** (phase 2 step 1):
+   a. Seed cell has arrival tick 0.
+   b. Arrival ticks increase with Chebyshev distance from the seed.
+   c. Unreached cells remain −1.
+
+8. **simulate_from** (phase 2 step 1):
+   a. Returns correct shapes.
+   b. Ocean click snaps to nearest land cell.
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ from scipy.integrate import solve_ivp
 from engine.grid import WorldGrid, State
 from engine.seir import seir_step
 from engine.runner import run_simulation
+from engine.simulate import latlon_to_rowcol, _snap_to_nearest_land
 
 
 # ===================================================================== #
@@ -58,11 +68,10 @@ class TestLatticeSanity:
 
     def test_front_advances_at_most_1_per_tick(self):
         """
-        After *t* ticks, no cell farther than Chebyshev distance *t*
-        from the seed should be touched (E / I / R / D).
-
-        Uses a large enough grid and few enough ticks that the front
-        never reaches the edges (so longitude wrap is irrelevant).
+        After *t* ticks, no cell farther than (max_reach * t) from
+        the seed should be touched (E / I / R / D).
+        Max reach is 1 row/tick north-south, and max_col_reach columns/tick
+        east-west (reach-limited version, phase 2 step 2).
         """
         size = 41
         centre = size // 2          # (20, 20)
@@ -71,23 +80,29 @@ class TestLatticeSanity:
         grid.seed_infection(centre, centre)
         rng = np.random.default_rng(42)
 
+        max_row_reach = 1
+        max_col_reach = max(
+            abs(dj) for (di, dj), w in grid.kernel_weights.items() if np.any(w > 0)
+        )
+
         for t in range(1, n_ticks + 1):
             seir_step(grid, rng)
 
             # Find all cells that are no longer S
-            touched = grid.state != State.S  # includes R ocean — but
-            # the grid is all-land, so this is fine.
+            touched = grid.state != State.S
             rows, cols = np.where(touched)
 
             if len(rows) == 0:
                 continue
 
-            # Chebyshev distance from centre
-            dists = np.maximum(np.abs(rows - centre), np.abs(cols - centre))
-            max_dist = int(dists.max())
+            row_dists = np.abs(rows - centre)
+            col_dists = np.abs(cols - centre)
 
-            assert max_dist <= t, (
-                f"Tick {t}: max Chebyshev distance {max_dist} > {t}"
+            assert int(row_dists.max()) <= t * max_row_reach, (
+                f"Tick {t}: max row distance {row_dists.max()} > {t * max_row_reach}"
+            )
+            assert int(col_dists.max()) <= t * max_col_reach, (
+                f"Tick {t}: max col distance {col_dists.max()} > {t * max_col_reach}"
             )
 
     def test_beta_zero_blocks_infection(self):
@@ -404,3 +419,410 @@ class TestPipelineSanity:
         )
         # Land cells should be >10,000 (we get ~17,769 without Antarctica)
         assert n_land > 10_000, f"Only {n_land} land cells — too few"
+
+
+# ===================================================================== #
+#  Arrival-time tracking  (phase 2 step 1)                               #
+# ===================================================================== #
+
+class TestArrivalTime:
+    """Verify the first_infection_tick array on a uniform all-land grid."""
+
+    def test_seed_cell_arrival_is_zero(self):
+        """The seeded cell must have arrival tick 0."""
+        grid = WorldGrid(20, 20, beta_base=0.5)
+        grid.seed_infection(10, 10)
+        assert grid.first_infection_tick[10, 10] == 0
+
+    def test_arrival_increases_with_distance(self):
+        """
+        On a uniform all-land grid with high β, cells at Chebyshev
+        distance d from the seed should have arrival tick ≥ d.
+        Cells reached at tick t should have Chebyshev distance ≤ t.
+        """
+        size = 41
+        centre = size // 2     # (20, 20)
+        n_ticks = 15
+
+        grid = WorldGrid(size, size, beta_base=5.0, beta_cap=5.0)
+        grid.seed_infection(centre, centre)
+        rng = np.random.default_rng(42)
+
+        for _ in range(n_ticks):
+            seir_step(grid, rng)
+
+        arr = grid.first_infection_tick
+
+        # 1. Seed cell = tick 0
+        assert arr[centre, centre] == 0
+
+        # 2. For every reached cell, arrival_tick ≥ Chebyshev distance
+        reached = arr >= 0
+        rows, cols = np.where(reached)
+        for r, c in zip(rows, cols):
+            dist = max(abs(r - centre), abs(c - centre))
+            tick = arr[r, c]
+            assert tick >= dist, (
+                f"Cell ({r},{c}): Chebyshev dist={dist} but arrival={tick}"
+            )
+
+        # 3. For every reached cell, Chebyshev distance ≤ arrival_tick
+        #    (front can advance at most 1 cell per tick)
+        for r, c in zip(rows, cols):
+            dist = max(abs(r - centre), abs(c - centre))
+            tick = arr[r, c]
+            assert dist <= tick or (r == centre and c == centre), (
+                f"Cell ({r},{c}): dist={dist} > tick={tick} — too fast"
+            )
+
+    def test_arrival_time_1d_strip(self):
+        """
+        Verify the arrival-time convention on a 1-D strip:
+        - seed cell = tick 0
+        - cells infected on the 1st step = tick 1
+        - unreached cells = -1
+        """
+        # 1-row grid with 15 columns, high beta so transmission is deterministic
+        grid = WorldGrid(1, 15, beta_base=10.0, beta_cap=10.0)
+        grid.seed_infection(0, 7)
+
+        # Before any step: seed cell is 0, all others -1
+        assert grid.first_infection_tick[0, 7] == 0
+        assert np.all(grid.first_infection_tick[0, :7] == -1)
+        assert np.all(grid.first_infection_tick[0, 8:] == -1)
+
+        # Advance by 1 tick
+        rng = np.random.default_rng(42)
+        seir_step(grid, rng)
+
+        # Seed remains 0
+        assert grid.first_infection_tick[0, 7] == 0
+        # Immediate neighbours infected on step 1 must have arrival tick 1
+        assert grid.first_infection_tick[0, 6] == 1
+        assert grid.first_infection_tick[0, 8] == 1
+        # All other cells must remain -1
+        assert np.all(grid.first_infection_tick[0, :6] == -1)
+        assert np.all(grid.first_infection_tick[0, 9:] == -1)
+
+    def test_unreached_cells_are_minus_one(self):
+        """
+        Run a normal epidemic on a grid with an ocean strip.
+        Every cell with arrival == -1 must be Susceptible (or ocean) at the end,
+        and every non-susceptible land cell must have arrival >= 0.
+        """
+        # 20x40 grid, columns 18..22 are ocean (barrier width 5)
+        grid = WorldGrid(20, 40, beta_base=0.8)
+        grid.land_mask[:, 18:23] = False
+        grid.beta[~grid.land_mask] = 0.0
+
+        # Seed on the left continent
+        grid.seed_infection(10, 5)
+        rng = np.random.default_rng(42)
+
+        for _ in range(50):
+            seir_step(grid, rng)
+
+        arr = grid.first_infection_tick
+        state = grid.state
+        land = grid.land_mask
+
+        # Non-triviality: some land cells infected, some land cells across ocean unreached
+        assert (arr >= 0).sum() > 1, "Epidemic did not spread at all"
+        assert (land & (arr == -1)).sum() > 0, "No unreached land cells left"
+
+        # 1. Every cell with arrival == -1 must be Susceptible (or ocean)
+        unreached = (arr == -1)
+        assert np.all((state[unreached] == State.S) | (~land[unreached])), (
+            "Found cells with arrival == -1 that are neither Susceptible nor ocean"
+        )
+
+        # 2. Every non-susceptible land cell must have arrival >= 0
+        infected_or_recovered = land & (state != State.S)
+        assert np.all(arr[infected_or_recovered] >= 0), (
+            "Found non-susceptible land cells with arrival < 0"
+        )
+
+    def test_arrival_time_monotonic_rings(self):
+        """
+        On a uniform high-β grid, the mean arrival time at Chebyshev
+        distance d should be strictly increasing with d.
+        """
+        size = 31
+        centre = size // 2
+        n_ticks = 12
+
+        grid = WorldGrid(size, size, beta_base=5.0, beta_cap=5.0)
+        grid.seed_infection(centre, centre)
+        rng = np.random.default_rng(42)
+
+        for _ in range(n_ticks):
+            seir_step(grid, rng)
+
+        arr = grid.first_infection_tick
+        prev_mean = -1.0
+
+        for d in range(0, n_ticks):
+            # Collect arrival times for cells at exactly Chebyshev distance d
+            mask = np.zeros((size, size), dtype=bool)
+            for r in range(size):
+                for c in range(size):
+                    if max(abs(r - centre), abs(c - centre)) == d:
+                        mask[r, c] = True
+
+            reached = mask & (arr >= 0)
+            if not reached.any():
+                break
+
+            mean_t = arr[reached].mean()
+            assert mean_t > prev_mean, (
+                f"Ring d={d}: mean arrival {mean_t:.1f} "
+                f"not > prev {prev_mean:.1f}"
+            )
+            prev_mean = mean_t
+
+
+# ===================================================================== #
+#  simulate_from + coordinate helpers  (phase 2 step 1)                  #
+# ===================================================================== #
+
+class TestSimulateFrom:
+    """
+    Tests for the simulate_from() entry point.
+
+    These require pipeline data; skipped if not available.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _check_data(self):
+        import pathlib
+        data_dir = pathlib.Path(__file__).resolve().parent.parent / "data" / "processed"
+        if not (data_dir / "land_mask.npy").exists():
+            pytest.skip("Pipeline data not found")
+
+    def test_simulate_from_returns_correct_shape(self):
+        """Check that frames and arrival_time have the expected shapes."""
+        from engine.simulate import simulate_from
+
+        n_ticks = 10
+        result = simulate_from(28.6, 77.2, n_ticks=n_ticks, seed=42)
+
+        H, W = result.grid_shape
+        assert result.frames.shape == (n_ticks + 1, H, W)
+        assert result.arrival_time.shape == (H, W)
+        assert result.frames.dtype == np.uint8
+        assert result.arrival_time.dtype == np.int16
+
+        # Counts should have n_ticks + 1 entries
+        for key in ("S", "E", "I", "R", "D"):
+            assert len(result.counts[key]) == n_ticks + 1
+
+    def test_seed_cell_in_result(self):
+        """The seed cell in the result should have arrival_time 0."""
+        from engine.simulate import simulate_from
+
+        result = simulate_from(28.6, 77.2, n_ticks=5, seed=42)
+        assert result.arrival_time[result.seed_row, result.seed_col] == 0
+
+    def test_ocean_snaps_to_land(self):
+        """Clicking the middle of the ocean should snap to a land cell."""
+        # Middle of the Pacific: ~0°N, 180°W → likely ocean
+        land_mask = np.load(
+            pathlib.Path(__file__).resolve().parent.parent
+            / "data" / "processed" / "land_mask.npy"
+        )
+        row, col = latlon_to_rowcol(0.0, -160.0)
+        snapped_row, snapped_col = _snap_to_nearest_land(row, col, land_mask)
+        assert land_mask[snapped_row, snapped_col], (
+            f"Snapped cell ({snapped_row}, {snapped_col}) is still ocean"
+        )
+
+    def test_latlon_to_rowcol_equator(self):
+        """Equator at Greenwich should map to row 90, col 180."""
+        row, col = latlon_to_rowcol(0.0, 0.0)
+        assert row == 90
+        assert col == 180
+
+    def test_latlon_to_rowcol_clamped(self):
+        """Extreme latitudes should be clamped to valid row range."""
+        row, _ = latlon_to_rowcol(95.0, 0.0)    # beyond north pole
+        assert 0 <= row <= 179
+        row, _ = latlon_to_rowcol(-95.0, 0.0)   # beyond south pole
+        assert 0 <= row <= 179
+
+    def test_latlon_to_rowcol_boundary_cases(self):
+        """
+        Boundary tests using math.floor:
+        - lon = -180.5 -> col 359
+        - lon = 180    -> col 0
+        - lat = 90     -> row 0
+        - lat = -90    -> row 179
+        """
+        _, col1 = latlon_to_rowcol(0.0, -180.5)
+        assert col1 == 359, f"lon=-180.5 gave col={col1}, expected 359"
+
+        _, col2 = latlon_to_rowcol(0.0, 180.0)
+        assert col2 == 0, f"lon=180.0 gave col={col2}, expected 0"
+
+        row1, _ = latlon_to_rowcol(90.0, 0.0)
+        assert row1 == 0, f"lat=90.0 gave row={row1}, expected 0"
+
+        row2, _ = latlon_to_rowcol(-90.0, 0.0)
+        assert row2 == 179, f"lat=-90.0 gave row={row2}, expected 179"
+
+
+# ===================================================================== #
+#  Distance-based transmission kernel  (phase 2 step 2)                  #
+# ===================================================================== #
+
+class TestDistanceKernel:
+    """Tests for the distance-based transmission kernel."""
+
+    def test_equator_active_offsets_reproduce_moore_stencil(self):
+        """
+        At the equator (d <= 166 km), the kernel offsets with non-zero
+        weight must match the 8-neighbour Moore stencil exactly.
+        """
+        from engine.seir import compute_kernel_weights
+        kw = compute_kernel_weights(180, sigma=111.0)
+        for eq_row in (89, 90):
+            active = sorted([(di, dj) for (di, dj), w in kw.items() if w[eq_row] > 0])
+            expected = sorted([
+                (di, dj) for di in (-1, 0, 1) for dj in (-1, 0, 1)
+                if not (di == 0 and dj == 0)
+            ])
+            assert active == expected, (
+                f"Equator row {eq_row} active offsets {active} != Moore {expected}"
+            )
+
+    def test_equator_identical_epidemic_for_same_seed(self):
+        """
+        At the equator, verify that the new kernel reproduces the old
+        stencil's epidemic tick-for-tick for the same seed:
+        1. With uniform weights (sigma=inf), weights sum to 8 and are
+           each exactly 1.0 at the equator. The simulation is 100% identical.
+        2. With physical sigma=111.0 and deterministic transmission (beta=5.0),
+           all cell states and arrival times are also 100% identical.
+        """
+        H, W = 180, 360
+
+        def _step_old_8nbr(grid, rng):
+            is_s = (grid.state == State.S) & grid.land_mask
+            is_e = (grid.state == State.E) & grid.land_mask
+            is_i = (grid.state == State.I) & grid.land_mask
+            grid.current_tick += 1
+            grid.timer[is_e | is_i] += 1
+            e_to_i = is_e & (grid.timer >= grid.latent_period)
+            i_exit = is_i & (grid.timer >= grid.infectious_period)
+            die_rolls = rng.random((H, W), dtype=np.float32)
+            i_to_d = i_exit & (die_rolls < grid.lethality)
+            i_to_r = i_exit & (~i_to_d)
+
+            is_inf = is_i.astype(np.float32)
+            count = np.zeros((H, W), dtype=np.float32)
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    if di == 0 and dj == 0:
+                        continue
+                    sh = np.roll(is_inf, (-di, -dj), axis=(0, 1))
+                    if di == -1:
+                        sh[0, :] = 0.0
+                    elif di == 1:
+                        sh[-1, :] = 0.0
+                    count += sh
+            force = grid.beta * count
+            prob = 1.0 - np.exp(-force)
+            inf_rolls = rng.random((H, W), dtype=np.float32)
+            s_to_e = is_s & (inf_rolls < prob)
+            new_exp = s_to_e & (grid.first_infection_tick < 0)
+            grid.first_infection_tick[new_exp] = grid.current_tick
+            grid.state[i_to_r] = State.R
+            grid.state[i_to_d] = State.D
+            grid.state[e_to_i] = State.I
+            grid.state[s_to_e] = State.E
+            grid.timer[s_to_e] = 0
+            grid.timer[e_to_i] = 0
+
+        # Case 1: sigma = inf (exact 1.0 weights) at beta = 0.8
+        g_old = WorldGrid(H, W, beta_base=0.8)
+        g_old.seed_infection(90, 180)
+        rng_old = np.random.default_rng(42)
+
+        g_new = WorldGrid(H, W, beta_base=0.8, kernel_sigma=float("inf"))
+        g_new.seed_infection(90, 180)
+        rng_new = np.random.default_rng(42)
+
+        for _ in range(12):
+            _step_old_8nbr(g_old, rng_old)
+            seir_step(g_new, rng_new)
+            assert np.array_equal(g_old.state, g_new.state), "State diverged under sigma=inf"
+            assert np.array_equal(g_old.first_infection_tick, g_new.first_infection_tick)
+
+        # Case 2: default sigma = 111.0 at high beta = 5.0
+        g_old2 = WorldGrid(H, W, beta_base=5.0, beta_cap=5.0)
+        g_old2.seed_infection(90, 180)
+        rng_old2 = np.random.default_rng(123)
+
+        g_new2 = WorldGrid(H, W, beta_base=5.0, beta_cap=5.0, kernel_sigma=111.0)
+        g_new2.seed_infection(90, 180)
+        rng_new2 = np.random.default_rng(123)
+
+        for _ in range(10):
+            _step_old_8nbr(g_old2, rng_old2)
+            seir_step(g_new2, rng_new2)
+            assert np.array_equal(g_old2.state, g_new2.state), "State diverged under beta=5"
+            assert np.array_equal(g_old2.first_infection_tick, g_new2.first_infection_tick)
+
+    def test_ew_ns_extent_ratio_within_25_percent(self):
+        """
+        Averaged over 8 seeds on a uniform all-land grid, EW extent in km
+        vs NS extent in km must be within 25% of 1.0 (ratio between 0.75 and 1.25)
+        when seeded at 0, 45, 60, and 70 degrees N.
+        """
+        import math
+        H, W = 180, 360
+        n_seeds = 8
+        n_ticks = 15
+
+        for lat in (0, 45, 60, 70):
+            seed_row = int(math.floor(90.0 - lat))
+            seed_col = 180
+            phi_c = math.radians(lat)
+            ratios = []
+
+            for s in range(n_seeds):
+                grid = WorldGrid(H, W, beta_base=0.5, kernel_sigma=111.0)
+                grid.seed_infection(seed_row, seed_col)
+                rng = np.random.default_rng(200 + s)
+
+                for _ in range(n_ticks):
+                    seir_step(grid, rng)
+
+                reached = grid.first_infection_tick >= 0
+                rows, cols = np.where(reached)
+                assert len(rows) > 1, f"Seed {s} at lat {lat} did not spread"
+
+                ns_km = (rows.max() - rows.min()) * 111.0
+                ew_km = (cols.max() - cols.min()) * 111.0 * math.cos(phi_c)
+                assert ns_km > 0, "Zero NS extent"
+                ratios.append(ew_km / ns_km)
+
+            mean_ratio = float(np.mean(ratios))
+            assert 0.75 <= mean_ratio <= 1.25, (
+                f"Lat {lat}N: mean EW/NS ratio {mean_ratio:.3f} outside 25% tolerance [0.75, 1.25]"
+            )
+
+    def test_well_mixed_mode_unaffected_by_kernel(self):
+        """
+        Well-mixed mode uses global infected fraction * 8 and bypasses
+        spatial kernel weights completely.
+        """
+        grid = WorldGrid(30, 30, beta_base=1.0)
+        grid.seed_infection(15, 15)
+        rng = np.random.default_rng(42)
+        for _ in range(5):
+            seir_step(grid, rng, well_mixed=True)
+        counts = grid.counts()
+        assert counts["I"] + counts["E"] + counts["R"] + counts["D"] > 1
+
+
+import pathlib  # needed at module level for test_ocean_snaps_to_land

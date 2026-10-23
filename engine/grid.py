@@ -77,6 +77,7 @@ class WorldGrid:
         infectious_period: int = 5,
         lethality: float = 0.10,
         imm_protection: float = 0.9,
+        kernel_sigma: float = 111.0,
     ):
         self.H, self.W = H, W
 
@@ -85,6 +86,11 @@ class WorldGrid:
         self.infectious_period = infectious_period
         self.lethality = lethality
         self.imm_protection = imm_protection
+        self.kernel_sigma = kernel_sigma
+
+        # ---- distance-based contact kernel (Phase 2 Step 2) ----
+        from engine.seir import compute_kernel_weights
+        self.kernel_weights = compute_kernel_weights(H, sigma=kernel_sigma)
 
         # ---- land mask (change 6) ----
         if land_mask is None:
@@ -100,6 +106,17 @@ class WorldGrid:
 
         # ---- timer: ticks spent in current E or I state ----
         self.timer = np.zeros((H, W), dtype=np.int16)
+
+        # ---- arrival time: tick when each cell was first infected ----
+        # Convention:
+        #   seed cell            → tick 0   (set by seed_infection)
+        #   cells infected on the 1st step → tick 1   (set by seir_step)
+        #   cells infected on the k-th step → tick k
+        #   never infected       → −1
+        self.first_infection_tick = np.full((H, W), -1, dtype=np.int16)
+
+        # ---- tick counter (incremented by seir_step before transitions) ----
+        self.current_tick: int = 0
 
         # ---- immunity (bool per cell, initially all non-immune) ----
         self.immunity = np.zeros((H, W), dtype=bool)
@@ -122,11 +139,12 @@ class WorldGrid:
     # ----------------------------------------------------------------- #
 
     def seed_infection(self, row: int, col: int) -> None:
-        """Set a single land cell to Infectious (I) with timer = 0."""
+        """Set a single land cell to Infectious (I) with arrival tick 0."""
         if not self.land_mask[row, col]:
             raise ValueError(f"Cell ({row}, {col}) is ocean — cannot seed.")
         self.state[row, col] = State.I
-        self.timer[row, col] = 0      # seir_step will increment on first tick
+        self.timer[row, col] = 0
+        self.first_infection_tick[row, col] = 0  # seed = tick 0
 
     def counts(self) -> dict[str, int]:
         """
